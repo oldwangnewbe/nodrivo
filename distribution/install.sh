@@ -1,0 +1,1402 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+RELEASE_REPO=${SBP_RELEASE_REPO:-oldwangnewbe/nodrivo}
+SING_BOX_REPO=${SBP_SING_BOX_REPO:-oldwangnewbe/sb-panel}
+VERSION=${SBP_VERSION:-latest}
+SING_BOX_VERSION=${SBP_SING_BOX_VERSION:-1.13.12}
+SING_BOX_RELEASE_VERSION=${SBP_SING_BOX_RELEASE_VERSION:-v0.2.3}
+SNELL_VERSION=5.0.1
+ACME_SH_VERSION=${SBP_ACME_SH_VERSION:-3.1.1}
+APP_ROOT=/opt/sb-panel
+BIN_DIR=${APP_ROOT}/bin
+DATA_DIR=${APP_ROOT}/data
+CONFIG_DIR=/etc/sb-panel
+ENV_FILE=${CONFIG_DIR}/panel.env
+PANEL_BIN=${BIN_DIR}/sb-panel
+SING_BOX_BIN=${BIN_DIR}/sing-box
+SNELL_BIN=${BIN_DIR}/snell-server
+ACTIVE_CONFIG=${CONFIG_DIR}/sing-box.json
+BACKUP_ROOT=/root/sb-panel-backups
+DRY_RUN=${SBP_DRY_RUN:-0}
+NONINTERACTIVE=${SBP_NONINTERACTIVE:-0}
+TLS_ENABLED=0
+WEB_MODE=
+WEB_CONTAINER=
+WEB_CONF_HOST=
+WEB_CONF_RUNTIME=
+WEB_ROOT_HOST=
+WEB_ROOT_RUNTIME=
+WEB_CERT_HOST=
+WEB_CERT_RUNTIME=
+WEB_CONFIG_FILE=
+WEB_CONFIG_BACKUP=
+WEB_PROXY_HOST=127.0.0.1
+WEB_BINARY=
+WEB_SERVICE=
+TLS_ROLLBACK_PENDING=0
+LIGHTWEIGHT_PRESENT=0
+LIGHTWEIGHT_REPLACED=0
+LIGHTWEIGHT_ROLLBACK_PENDING=0
+LIGHTWEIGHT_BACKUP=
+
+log() { printf '\033[1;35m[Nodrivo]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[Nodrivo]\033[0m %s\n' "$*" >&2; }
+die() { printf '\033[1;31m[Nodrivo]\033[0m %s\n' "$*" >&2; exit 1; }
+
+has_tty() { [[ ${NONINTERACTIVE} != 1 && -r /dev/tty && -w /dev/tty ]]; }
+
+prompt() {
+  local label=$1 default=${2:-} answer
+  if ! has_tty; then
+    printf '%s\n' "${default}"
+    return
+  fi
+  if [[ -n ${default} ]]; then
+    printf '\033[1;36m%s\033[0m [%s]: ' "${label}" "${default}" >/dev/tty
+  else
+    printf '\033[1;36m%s\033[0m: ' "${label}" >/dev/tty
+  fi
+  IFS= read -r answer </dev/tty || answer=
+  printf '%s\n' "${answer:-${default}}"
+}
+
+prompt_secret() {
+  local label=$1 answer
+  if ! has_tty; then
+    printf '\n'
+    return
+  fi
+  printf '\033[1;36m%s\033[0m（留空则自动生成）: ' "${label}" >/dev/tty
+  IFS= read -r -s answer </dev/tty || answer=
+  printf '\n' >/dev/tty
+  printf '%s\n' "${answer}"
+}
+
+confirm() {
+  local label=$1 default=${2:-yes} suffix answer
+  if ! has_tty; then
+    [[ ${default} == yes ]]
+    return
+  fi
+  [[ ${default} == yes ]] && suffix='Y/n' || suffix='y/N'
+  printf '\033[1;36m%s\033[0m [%s]: ' "${label}" "${suffix}" >/dev/tty
+  IFS= read -r answer </dev/tty || answer=
+  answer=${answer:-${default}}
+  [[ ${answer,,} == y || ${answer,,} == yes || ${answer} == 是 ]]
+}
+
+if [[ ${DRY_RUN} != 1 && ${EUID} -ne 0 ]]; then
+  die "请使用 root 运行：curl -fsSL https://raw.githubusercontent.com/${RELEASE_REPO}/main/distribution/install.sh | sudo bash"
+fi
+if [[ $(uname -s) != Linux ]]; then
+  die "一键安装器目前只支持 Linux。"
+fi
+if [[ ${DRY_RUN} != 1 ]] && ! command -v systemctl >/dev/null 2>&1; then
+  die "当前系统没有 systemd，暂不支持一键安装。"
+fi
+
+case $(uname -m) in
+  x86_64|amd64) ARCH=amd64 ;;
+  aarch64|arm64) ARCH=arm64 ;;
+  *) die "暂不支持的 CPU 架构：$(uname -m)" ;;
+esac
+
+install_dependencies() {
+  local missing=0
+  for command in curl tar unzip jq openssl flock ss sha256sum socat python3; do
+    command -v "${command}" >/dev/null 2>&1 || missing=1
+  done
+  [[ ${missing} -eq 0 ]] && return
+  log "安装运行依赖"
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -y
+    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl tar unzip jq openssl util-linux iproute2 passwd socat python3
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y ca-certificates curl tar unzip jq openssl util-linux iproute shadow-utils socat python3
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y ca-certificates curl tar unzip jq openssl util-linux iproute shadow-utils socat python3
+  else
+    die "无法自动安装依赖，请先安装 curl、tar、unzip、jq、openssl、flock、ss、sha256sum、socat 和 python3。"
+  fi
+}
+
+if [[ ${DRY_RUN} != 1 ]]; then
+  install_dependencies
+else
+  command -v curl >/dev/null 2>&1 || die "缺少 curl"
+  command -v sha256sum >/dev/null 2>&1 || die "缺少 sha256sum"
+fi
+
+TMP_DIR=$(mktemp -d /tmp/sb-panel-install.XXXXXX)
+cleanup() {
+  local status=$?
+  if [[ ${TLS_ROLLBACK_PENDING} == 1 ]] && declare -F rollback_web_config >/dev/null 2>&1; then
+    rollback_web_config || true
+  fi
+  if [[ ${LIGHTWEIGHT_ROLLBACK_PENDING} == 1 ]] && declare -F rollback_lightweight_node >/dev/null 2>&1; then
+    rollback_lightweight_node || true
+  fi
+  rm -rf "${TMP_DIR}"
+  return "${status}"
+}
+trap cleanup EXIT
+
+if [[ ${DRY_RUN} != 1 ]] && { [[ -d /opt/sailbox-node || -d /etc/sailbox-node ]] || systemctl list-unit-files sailbox-node.service --no-legend 2>/dev/null | grep -q '^sailbox-node\.service'; }; then
+  LIGHTWEIGHT_PRESENT=1
+  warn "检测到本机已安装 Nodrivo 轻量版；完整版不能与轻量版同时运行。"
+  case ${SBP_REPLACE_LIGHTWEIGHT:-ask} in
+    1|yes|true|on) ;;
+    0|no|false|off) die "已保留轻量版，未安装完整版。" ;;
+    ask)
+      if ! has_tty; then
+        die "非交互环境检测到轻量版。确认覆盖时请设置 SBP_REPLACE_LIGHTWEIGHT=1。"
+      fi
+      confirm "是否备份轻量版并覆盖安装完整版" yes || die "已保留轻量版，未安装完整版。"
+      ;;
+    *) die "SBP_REPLACE_LIGHTWEIGHT 仅支持 ask、1 或 0。" ;;
+  esac
+fi
+
+if [[ ${VERSION} == latest ]]; then
+  RELEASE_BASE="https://github.com/${RELEASE_REPO}/releases/latest/download"
+else
+  [[ ${VERSION} =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] || die "SBP_VERSION 格式无效：${VERSION}"
+  RELEASE_BASE="https://github.com/${RELEASE_REPO}/releases/download/${VERSION}"
+fi
+PANEL_ASSET=sb-panel-linux-${ARCH}
+SING_BOX_ASSET=sing-box-sb-panel-${SING_BOX_VERSION}-linux-${ARCH}
+SNELL_ASSET=snell-server-v${SNELL_VERSION}-linux-$([[ ${ARCH} == arm64 ]] && echo aarch64 || echo amd64).zip
+RUNTIME_ASSET=sb-panel-runtime.tar.gz
+UPGRADE_PUBLIC_KEY_ASSET=upgrade-public-key.txt
+DEFAULT_LICENSE_SERVER_URL=https://nodrivo.malariafly.com
+DEFAULT_LICENSE_PUBLIC_KEY=KWktJUBOxFBgjNhftsXKcvPn/go7nn5N2EZtfbTMy/E
+
+download() {
+  local url=$1 target=$2
+  local label=${3:-$(basename "${target}")}
+  if [[ -t 2 ]]; then
+    log "下载 ${label}"
+    curl --fail --location --progress-bar --retry 3 --connect-timeout 12 --output "${target}" "${url}"
+  else
+    curl --fail --location --silent --show-error --retry 3 --connect-timeout 12 --output "${target}" "${url}"
+  fi
+}
+
+case ${ARCH} in
+  amd64) expected_snell=9bea1c2b9e35b73b31634856c04d18c393072b9e5dcde6a32781d8b8f908c539 ;;
+  arm64) expected_snell=2f178bf5ac468ce1a130454efa40a0603fbbe4e47ecc4880a989f4abc7f824cf ;;
+esac
+
+if [[ ${DRY_RUN} == 1 && -z ${SBP_CACHE_DIR:-} ]]; then
+  CACHE_DIR=${TMP_DIR}/cache
+else
+  CACHE_DIR=${SBP_CACHE_DIR:-/var/cache/sailbox}/${RELEASE_REPO//\//_}/${VERSION}/${ARCH}
+fi
+install -d -m 0750 "${CACHE_DIR}"
+
+sha256_file() { sha256sum "$1" | awk '{print $1}'; }
+
+cached_download() {
+  local url=$1 asset=$2 expected_hash=$3 cache_file=${CACHE_DIR}/$2 part=${CACHE_DIR}/.$2.part actual_hash
+  if [[ -f ${cache_file} ]]; then
+    actual_hash=$(sha256_file "${cache_file}")
+    if [[ ${actual_hash} == "${expected_hash}" ]]; then
+      log "使用缓存 ${asset}（SHA-256 已校验）"
+      cp -f "${cache_file}" "${TMP_DIR}/${asset}"
+      return
+    fi
+    warn "缓存 ${asset} 校验不符，将重新下载。"
+    rm -f "${cache_file}"
+  fi
+  rm -f "${part}"
+  download "${url}" "${part}" "${asset}"
+  actual_hash=$(sha256_file "${part}")
+  if [[ ${actual_hash} != "${expected_hash}" ]]; then
+    rm -f "${part}"
+    die "${asset} 下载文件校验失败，安装已停止。"
+  fi
+  mv -f "${part}" "${cache_file}"
+  chmod 0640 "${cache_file}"
+  cp -f "${cache_file}" "${TMP_DIR}/${asset}"
+}
+
+log "准备 Nodrivo ${VERSION} (${ARCH})"
+download "${RELEASE_BASE}/checksums.txt" "${TMP_DIR}/checksums.txt" checksums.txt
+expected_panel=$(awk -v file="${PANEL_ASSET}" '$2 == file {print $1}' "${TMP_DIR}/checksums.txt")
+[[ ${expected_panel} =~ ^[0-9a-fA-F]{64}$ ]] || die "发布包缺少有效面板校验值。"
+expected_runtime=$(awk -v file="${RUNTIME_ASSET}" '$2 == file {print $1}' "${TMP_DIR}/checksums.txt")
+[[ ${expected_runtime} =~ ^[0-9a-fA-F]{64}$ ]] || die "发布包缺少有效运行时脚本校验值。"
+expected_sing_box=$(awk -v file="${SING_BOX_ASSET}" '$2 == file {print $1}' "${TMP_DIR}/checksums.txt")
+[[ ${expected_sing_box} =~ ^[0-9a-fA-F]{64}$ ]] || die "发布包缺少有效 sing-box 校验值。"
+expected_upgrade_public_key=$(awk -v file="${UPGRADE_PUBLIC_KEY_ASSET}" '$2 == file {print $1}' "${TMP_DIR}/checksums.txt")
+
+cached_download "${RELEASE_BASE}/${PANEL_ASSET}" "${PANEL_ASSET}" "${expected_panel}"
+cached_download "https://github.com/${SING_BOX_REPO}/releases/download/${SING_BOX_RELEASE_VERSION}/${SING_BOX_ASSET}" "${SING_BOX_ASSET}" "${expected_sing_box}"
+cached_download "https://dl.nssurge.com/snell/${SNELL_ASSET}" "${SNELL_ASSET}" "${expected_snell}"
+cached_download "${RELEASE_BASE}/${RUNTIME_ASSET}" "${RUNTIME_ASSET}" "${expected_runtime}"
+if [[ ${expected_upgrade_public_key} =~ ^[0-9a-fA-F]{64}$ ]]; then
+  cached_download "${RELEASE_BASE}/${UPGRADE_PUBLIC_KEY_ASSET}" "${UPGRADE_PUBLIC_KEY_ASSET}" "${expected_upgrade_public_key}"
+fi
+
+unzip -p "${TMP_DIR}/${SNELL_ASSET}" snell-server >"${TMP_DIR}/snell-server"
+install -d -m 0700 "${TMP_DIR}/runtime"
+tar -xzf "${TMP_DIR}/${RUNTIME_ASSET}" -C "${TMP_DIR}/runtime"
+chmod 0755 "${TMP_DIR}/snell-server"
+chmod 0755 "${TMP_DIR}/${PANEL_ASSET}"
+chmod 0755 "${TMP_DIR}/${SING_BOX_ASSET}"
+
+if [[ ${DRY_RUN} == 1 ]]; then
+  log "检查通过：发布包可下载，SHA-256 校验正确。"
+  printf 'repository=%s\nversion=%s\narchitecture=%s\nmode=%s\n' \
+    "${RELEASE_REPO}" "${VERSION}" "${ARCH}" "$([[ -x ${PANEL_BIN} ]] && echo upgrade || echo install)"
+  exit 0
+fi
+
+wait_for_health() {
+  local port=$1
+  for _ in $(seq 1 60); do
+    if curl -fsS --max-time 2 "http://127.0.0.1:${port}/healthz" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
+panel_port_from_env() {
+  local listen
+  listen=$(awk -F= '$1 == "PANEL_LISTEN" {print $2; exit}' "${ENV_FILE}")
+  listen=${listen:-0.0.0.0:18080}
+  printf '%s\n' "${listen##*:}"
+}
+
+env_value() {
+  local key=$1
+  awk -F= -v key="${key}" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "${ENV_FILE}" 2>/dev/null || true
+}
+
+set_env_value() {
+  local key=$1 value=$2 next=${TMP_DIR}/panel.env.next
+  awk -F= -v key="${key}" '$1 != key' "${ENV_FILE}" >"${next}"
+  printf '%s=%s\n' "${key}" "${value}" >>"${next}"
+  install -o root -g sb-panel -m 0640 "${next}" "${ENV_FILE}"
+}
+
+ensure_cert_reload_permissions() {
+  local cert_path=$1 key_path=$2 helper=/usr/local/libexec/sb-panel-web-reload next=${TMP_DIR}/web-reload.next
+  [[ -f ${helper} ]] || return 0
+  grep -Eq '# (Nodrivo|SailBox) protocol certificate permissions' "${helper}" && return 0
+  awk -v cert="${cert_path}" -v key="${key_path}" '
+    NR == 2 {
+      print
+      print "# Nodrivo protocol certificate permissions"
+      print "chown root:sb-panel \047" key "\047"
+      print "chmod 0640 \047" key "\047"
+      print "chmod 0644 \047" cert "\047"
+      next
+    }
+    { print }
+  ' "${helper}" >"${next}"
+  install -o root -g root -m 0755 "${next}" "${helper}"
+}
+
+install_snell_service() {
+  install -o root -g root -m 0755 "${TMP_DIR}/snell-server" "${SNELL_BIN}"
+  install -o root -g root -m 0755 "${TMP_DIR}/runtime/sb-panel-snell-apply.sh" /usr/local/libexec/sb-panel-snell-apply
+  install -o root -g root -m 0755 "${TMP_DIR}/runtime/sb-panel-snell-run.sh" /usr/local/libexec/sb-panel-snell-run
+  install -o root -g root -m 0644 "${TMP_DIR}/runtime/snell-sb-panel@.service" /etc/systemd/system/snell-sb-panel@.service
+  install -o root -g root -m 0644 "${TMP_DIR}/runtime/snell-sb-panel-apply.service" /etc/systemd/system/snell-sb-panel-apply.service
+  install -o root -g root -m 0644 "${TMP_DIR}/runtime/snell-sb-panel-apply.path" /etc/systemd/system/snell-sb-panel-apply.path
+  install -d -o root -g sb-panel -m 0750 /etc/sb-panel/snell-users
+  systemctl daemon-reload
+  systemctl enable --now snell-sb-panel-apply.path >/dev/null
+  systemctl is-active --quiet snell-sb-panel-apply.path || die "Snell 用户服务同步器启动失败。"
+}
+
+install_panel_upgrade_service() {
+  install -o root -g root -m 0755 "${TMP_DIR}/runtime/sb-panel-db-restore.sh" /usr/local/libexec/sb-panel-db-restore
+  install -o root -g root -m 0755 "${TMP_DIR}/runtime/sb-panel-upgrade.sh" /usr/local/libexec/sb-panel-upgrade
+  install -o root -g root -m 0644 "${TMP_DIR}/runtime/sb-panel-upgrade.service" /etc/systemd/system/sb-panel-upgrade.service
+  install -o root -g root -m 0644 "${TMP_DIR}/runtime/sb-panel-upgrade.path" /etc/systemd/system/sb-panel-upgrade.path
+  systemctl daemon-reload
+  systemctl enable --now sb-panel-upgrade.path >/dev/null
+  systemctl is-active --quiet sb-panel-upgrade.path || die "面板安全升级监听器启动失败。"
+}
+
+install_management_cli() {
+  install -o root -g root -m 0755 "${TMP_DIR}/runtime/sailbox" /usr/local/bin/nodrivo
+  ln -sfn /usr/local/bin/nodrivo /usr/local/bin/sailbox
+  install -o root -g root -m 0755 "${TMP_DIR}/runtime/sailbox-certificate.sh" /usr/local/libexec/sailbox-certificate
+  ln -sfn /usr/local/bin/nodrivo /root/nodrivo
+  ln -sfn /usr/local/bin/nodrivo /root/sailbox
+}
+
+lightweight_paths() {
+  printf '%s\n' \
+    /etc/systemd/system/sailbox-node.service \
+    /etc/systemd/system/snell-sailbox-node-apply.path \
+    /etc/systemd/system/snell-sailbox-node-apply.service \
+    /etc/systemd/system/snell-sailbox-node@.service \
+    /etc/systemd/system/sailbox-node-cert-renew.service \
+    /etc/systemd/system/sailbox-node-cert-renew.timer \
+    /usr/local/libexec/sailbox-node-cert-renew \
+    /usr/local/libexec/sailbox-node-snell-apply \
+    /usr/local/libexec/sailbox-node-snell-run
+}
+
+rollback_lightweight_node() {
+  [[ -n ${LIGHTWEIGHT_BACKUP} && -d ${LIGHTWEIGHT_BACKUP} ]] || return 0
+  warn "完整版安装未完成，正在恢复原轻量版。"
+  systemctl stop sb-panel.service sing-box-sb-panel.service >/dev/null 2>&1 || true
+  [[ ! -d ${LIGHTWEIGHT_BACKUP}/etc-sailbox-node ]] || mv "${LIGHTWEIGHT_BACKUP}/etc-sailbox-node" /etc/sailbox-node
+  [[ ! -d ${LIGHTWEIGHT_BACKUP}/opt-sailbox-node ]] || mv "${LIGHTWEIGHT_BACKUP}/opt-sailbox-node" /opt/sailbox-node
+  local path source unit enabled active
+  while IFS= read -r path; do
+    source=${LIGHTWEIGHT_BACKUP}/removed${path}
+    [[ ! -e ${source} && ! -L ${source} ]] || {
+      install -d -m 0755 "$(dirname "${path}")"
+      mv "${source}" "${path}"
+    }
+  done < <(lightweight_paths)
+  systemctl daemon-reload
+  if [[ -f ${LIGHTWEIGHT_BACKUP}/unit-state.txt ]]; then
+    while read -r unit enabled active; do
+      [[ -n ${unit} ]] || continue
+      if [[ ${enabled} == enabled ]]; then systemctl enable "${unit}" >/dev/null 2>&1 || true; fi
+      if [[ ${active} == active ]]; then systemctl start "${unit}" >/dev/null 2>&1 || true; fi
+    done <"${LIGHTWEIGHT_BACKUP}/unit-state.txt"
+  fi
+  LIGHTWEIGHT_ROLLBACK_PENDING=0
+}
+
+replace_lightweight_node() {
+  local stamp path target unit enabled active
+  stamp=$(date -u +%Y%m%d-%H%M%S)
+  LIGHTWEIGHT_BACKUP=${BACKUP_ROOT}/${stamp}-lightweight-before-full
+  install -d -m 0700 "${LIGHTWEIGHT_BACKUP}"
+  {
+    for unit in sailbox-node.service snell-sailbox-node-apply.path sailbox-node-cert-renew.timer; do
+      enabled=$(systemctl is-enabled "${unit}" 2>/dev/null || true)
+      active=$(systemctl is-active "${unit}" 2>/dev/null || true)
+      printf '%s %s %s\n' "${unit}" "${enabled:-unknown}" "${active:-inactive}"
+    done
+    while read -r unit _; do
+      [[ -n ${unit} ]] || continue
+      enabled=$(systemctl is-enabled "${unit}" 2>/dev/null || true)
+      active=$(systemctl is-active "${unit}" 2>/dev/null || true)
+      printf '%s %s %s\n' "${unit}" "${enabled:-unknown}" "${active:-inactive}"
+    done < <(systemctl list-units --all --no-legend 'snell-sailbox-node@*.service' 2>/dev/null || true)
+  } | sort -u >"${LIGHTWEIGHT_BACKUP}/unit-state.txt"
+
+  LIGHTWEIGHT_ROLLBACK_PENDING=1
+  while read -r unit _ _; do
+    [[ -n ${unit} ]] || continue
+    systemctl disable --now "${unit}" >/dev/null 2>&1 || true
+  done <"${LIGHTWEIGHT_BACKUP}/unit-state.txt"
+
+  [[ ! -d /etc/sailbox-node ]] || mv /etc/sailbox-node "${LIGHTWEIGHT_BACKUP}/etc-sailbox-node"
+  [[ ! -d /opt/sailbox-node ]] || mv /opt/sailbox-node "${LIGHTWEIGHT_BACKUP}/opt-sailbox-node"
+  while IFS= read -r path; do
+    [[ ! -e ${path} && ! -L ${path} ]] && continue
+    target=${LIGHTWEIGHT_BACKUP}/removed${path}
+    install -d -m 0700 "$(dirname "${target}")"
+    mv "${path}" "${target}"
+  done < <(lightweight_paths)
+  systemctl daemon-reload
+  LIGHTWEIGHT_REPLACED=1
+  log "轻量版已停止并移入可恢复备份：${LIGHTWEIGHT_BACKUP}"
+}
+
+migrate_automatic_protocol_runtime() {
+  local public_host safe cert_path key_path candidate snell_enabled agent_token upgrade_token upgrade_public_key central_enabled license_server_url license_public_key
+  public_host=$(env_value PUBLIC_HOST)
+  SNELL_PORT=$(env_value SNELL_PORT)
+  SNELL_PORT=${SNELL_PORT:-34448}
+  SNELL_PSK=$(env_value SNELL_PSK)
+  SNELL_PSK=${SNELL_PSK:-$(openssl rand -hex 16)}
+  snell_enabled=$(env_value SNELL_ENABLED)
+  snell_enabled=${snell_enabled:-false}
+  set_env_value SNELL_PORT "${SNELL_PORT}"
+  set_env_value SNELL_PSK "${SNELL_PSK}"
+  set_env_value SNELL_ENABLED "${snell_enabled}"
+  central_enabled=true
+  agent_token=$(env_value PANEL_AGENT_TOKEN)
+  agent_token=${agent_token:-$(openssl rand -hex 32)}
+  upgrade_token=$(env_value PANEL_UPGRADE_TOKEN)
+  upgrade_token=${upgrade_token:-$(openssl rand -hex 32)}
+  [[ ${upgrade_token} != "${agent_token}" ]] || upgrade_token=$(openssl rand -hex 32)
+  upgrade_public_key=$(env_value PANEL_UPGRADE_PUBLIC_KEY)
+  upgrade_public_key=${upgrade_public_key:-${SBP_UPGRADE_PUBLIC_KEY:-$(tr -d '\r\n' <"${TMP_DIR}/${UPGRADE_PUBLIC_KEY_ASSET}" 2>/dev/null || true)}}
+  license_server_url=$(env_value NODRIVO_LICENSE_SERVER_URL)
+  license_server_url=${license_server_url:-${NODRIVO_LICENSE_SERVER_URL:-${DEFAULT_LICENSE_SERVER_URL}}}
+  license_public_key=$(env_value NODRIVO_LICENSE_PUBLIC_KEY)
+  license_public_key=${license_public_key:-${NODRIVO_LICENSE_PUBLIC_KEY:-${DEFAULT_LICENSE_PUBLIC_KEY}}}
+  [[ ${license_server_url} =~ ^https://[^[:space:]]+$ ]] || die "Nodrivo 授权中心地址无效。"
+  [[ ${license_public_key} =~ ^[A-Za-z0-9_+/-]{43}$ ]] || die "Nodrivo 授权验签公钥格式无效。"
+  set_env_value PANEL_CENTRAL_ENABLED "${central_enabled}"
+  set_env_value PANEL_AGENT_TOKEN "${agent_token}"
+  set_env_value PANEL_UPGRADE_TOKEN "${upgrade_token}"
+  [[ -z ${upgrade_public_key} ]] || set_env_value PANEL_UPGRADE_PUBLIC_KEY "${upgrade_public_key}"
+  set_env_value NODRIVO_LICENSE_SERVER_URL "${license_server_url}"
+  set_env_value NODRIVO_LICENSE_PUBLIC_KEY "${license_public_key}"
+  install_snell_service
+  install_panel_upgrade_service
+  install_management_cli
+
+  cert_path=$(env_value TLS_CERT_PATH)
+  key_path=$(env_value TLS_KEY_PATH)
+  if [[ ! -s ${cert_path:-/nonexistent} || ! -s ${key_path:-/nonexistent} ]] && [[ -n ${public_host} ]]; then
+    safe=${public_host//[^A-Za-z0-9.-]/_}
+    for candidate in /etc/nginx /usr/local/openresty /opt/1panel/apps/openresty; do
+      [[ -d ${candidate} ]] || continue
+      cert_path=$(find "${candidate}" -type f -path "*/sb-panel-certs/${safe}/fullchain.pem" -print -quit 2>/dev/null || true)
+      [[ -n ${cert_path} ]] || continue
+      key_path=${cert_path%/fullchain.pem}/privkey.pem
+      [[ -s ${key_path} ]] && break
+    done
+  fi
+  if [[ -n ${public_host} && -s ${cert_path:-/nonexistent} && -s ${key_path:-/nonexistent} ]]; then
+    chown root:sb-panel "${key_path}"
+    chmod 0640 "${key_path}"
+    chmod 0644 "${cert_path}"
+    set_env_value ANYTLS_SERVER_NAME "${public_host}"
+    set_env_value TLS_CERT_PATH "${cert_path}"
+    set_env_value TLS_KEY_PATH "${key_path}"
+    ensure_cert_reload_permissions "${cert_path}" "${key_path}"
+  else
+    warn "没有找到面板域名证书；TLS 协议需要先为面板启用自动 HTTPS。"
+  fi
+}
+
+upgrade_existing() {
+  local stamp backup panel_port core_pid_before core_pid_after
+  stamp=$(date -u +%Y%m%d-%H%M%S)
+  backup=${BACKUP_ROOT}/${stamp}-release-upgrade
+  panel_port=$(panel_port_from_env)
+  core_pid_before=$(tr -cd '0-9' </run/sb-panel-sing-box/main.pid 2>/dev/null || true)
+  install -d -m 0700 "${backup}"
+  systemctl stop sb-panel.service
+  cp -a "${PANEL_BIN}" "${backup}/sb-panel"
+  cp -a "${ENV_FILE}" "${backup}/panel.env"
+  [[ ! -f ${DATA_DIR}/panel.db ]] || cp -a "${DATA_DIR}/panel.db" "${backup}/panel.db"
+  [[ ! -f ${DATA_DIR}/sing-box.json ]] || cp -a "${DATA_DIR}/sing-box.json" "${backup}/sing-box.candidate.json"
+  [[ ! -f ${ACTIVE_CONFIG} ]] || cp -a "${ACTIVE_CONFIG}" "${backup}/sing-box.active.json"
+  install -o root -g root -m 0755 "${TMP_DIR}/${PANEL_ASSET}" "${PANEL_BIN}"
+  migrate_automatic_protocol_runtime
+  if ! systemctl start sb-panel.service || ! wait_for_health "${panel_port}"; then
+    warn "升级健康检查失败，正在恢复旧版本。"
+    systemctl stop sb-panel.service >/dev/null 2>&1 || true
+    install -o root -g root -m 0755 "${backup}/sb-panel" "${PANEL_BIN}"
+    install -o root -g sb-panel -m 0640 "${backup}/panel.env" "${ENV_FILE}"
+    systemctl start sb-panel.service
+    die "升级失败，已恢复。备份：${backup}"
+  fi
+  core_pid_after=$(tr -cd '0-9' </run/sb-panel-sing-box/main.pid 2>/dev/null || true)
+  if [[ -n ${core_pid_before} && ${core_pid_before} != "${core_pid_after}" ]]; then
+    warn "面板升级后 sing-box PID 发生变化，请检查服务日志。"
+  fi
+  log "升级完成：$(${PANEL_BIN} version)"
+  log "备份目录：${backup}"
+  if [[ ${LIGHTWEIGHT_REPLACED} == 1 ]]; then
+    LIGHTWEIGHT_ROLLBACK_PENDING=0
+    log "原轻量版备份：${LIGHTWEIGHT_BACKUP}"
+  fi
+}
+
+if [[ ${LIGHTWEIGHT_PRESENT} == 1 ]]; then
+  replace_lightweight_node
+fi
+
+if [[ -x ${PANEL_BIN} && -f ${ENV_FILE} ]]; then
+  if [[ -f /etc/systemd/system/sb-panel.service && -f /etc/systemd/system/sing-box-sb-panel.service && -s ${ACTIVE_CONFIG} ]]; then
+    upgrade_existing
+    exit 0
+  fi
+  warn "检测到一次未完成的 Nodrivo 安装，将安全续装并保留现有数据和证书。"
+fi
+
+port_in_use() {
+  local port=$1
+  ss -H -ltn | awk '{print $4}' | grep -Eq "(^|:|\\])${port}$"
+}
+
+valid_port() { [[ $1 =~ ^[0-9]+$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
+is_ipv4() {
+  [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  local octet
+  local -a octets
+  IFS=. read -r -a octets <<<"$1"
+  for octet in "${octets[@]}"; do ((10#${octet} <= 255)) || return 1; done
+}
+is_dns_name() {
+  # A dotted IPv4 literal also matches the generic DNS-label grammar below.
+  # Reject it explicitly so IP-only installations never enter ACME HTTP-01.
+  [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && return 1
+  [[ $1 == *.* && $1 != .* && $1 != *. && $1 != *..* ]] || return 1
+  local label
+  local -a labels
+  IFS=. read -r -a labels <<<"$1"
+  for label in "${labels[@]}"; do
+    [[ ${#label} -ge 1 && ${#label} -le 63 && ${label} =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+  done
+  (( ${#1} <= 253 ))
+}
+
+DETECTED_PUBLIC_IP=$(curl -4fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)
+if [[ -z ${DETECTED_PUBLIC_IP} ]] && command -v hostname >/dev/null 2>&1; then
+  DETECTED_PUBLIC_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+fi
+PUBLIC_HOST=${SBP_PUBLIC_HOST:-}
+PUBLIC_HOST=$(prompt "公网域名或 IPv4" "${PUBLIC_HOST:-${DETECTED_PUBLIC_IP}}")
+[[ ${PUBLIC_HOST} =~ ^[A-Za-z0-9.-]+$ ]] || die "公网地址格式无效。"
+is_ipv4 "${PUBLIC_HOST}" || is_dns_name "${PUBLIC_HOST}" || die "请输入有效的域名或 IPv4 地址。"
+
+case ${SBP_TLS:-auto} in
+  1|yes|true|on) TLS_ENABLED=1 ;;
+  0|no|false|off) TLS_ENABLED=0 ;;
+  auto)
+    if is_dns_name "${PUBLIC_HOST}" && confirm "为面板自动申请 Let's Encrypt 证书" yes; then
+      TLS_ENABLED=1
+    fi
+    ;;
+  *) die "SBP_TLS 仅支持 auto、1 或 0。" ;;
+esac
+if [[ ${TLS_ENABLED} == 1 ]] && ! is_dns_name "${PUBLIC_HOST}"; then
+  die "Let's Encrypt 自动证书需要域名，不能使用 IP 地址。"
+fi
+
+PANEL_PUBLIC_PORT=${SBP_PANEL_PORT:-18080}
+PANEL_PUBLIC_PORT=$(prompt "面板公网端口" "${PANEL_PUBLIC_PORT}")
+valid_port "${PANEL_PUBLIC_PORT}" || die "面板公网端口无效。"
+
+if [[ ${TLS_ENABLED} == 1 ]]; then
+  PANEL_PORT=${SBP_PANEL_BACKEND_PORT:-}
+  if [[ -n ${PANEL_PORT} ]]; then
+    valid_port "${PANEL_PORT}" || die "SBP_PANEL_BACKEND_PORT 无效。"
+    port_in_use "${PANEL_PORT}" && die "面板内部端口 ${PANEL_PORT} 已被占用。"
+  else
+    for candidate in 18081 18082 18083 18084 18085 18086 18087 18088 18089; do
+      if [[ ${candidate} != "${PANEL_PUBLIC_PORT}" ]] && ! port_in_use "${candidate}"; then
+        PANEL_PORT=${candidate}
+        break
+      fi
+    done
+    [[ -n ${PANEL_PORT} ]] || die "18081–18089 均已占用，请用 SBP_PANEL_BACKEND_PORT 指定内部端口。"
+  fi
+else
+  PANEL_PORT=${PANEL_PUBLIC_PORT}
+  port_in_use "${PANEL_PORT}" && die "面板端口 ${PANEL_PORT} 已被占用。"
+fi
+
+VLESS_REQUESTED=${SBP_VLESS_PORT:-443}
+VLESS_REQUESTED=$(prompt "VLESS Reality 公网端口" "${VLESS_REQUESTED}")
+valid_port "${VLESS_REQUESTED}" || die "VLESS 端口无效。"
+if port_in_use "${VLESS_REQUESTED}"; then
+  if [[ -z ${SBP_VLESS_PORT:-} && ${VLESS_REQUESTED} == 443 ]] && ! port_in_use 34443; then
+    warn "公网 443 已被占用，VLESS 自动改用 34443。"
+    VLESS_PORT=34443
+  else
+    die "节点端口 ${VLESS_REQUESTED} 已被占用；安装器不会强行停止现有网站或代理。"
+  fi
+else
+  VLESS_PORT=${VLESS_REQUESTED}
+fi
+[[ ${VLESS_PORT} != "${PANEL_PORT}" ]] || die "面板监听端口与 VLESS 端口不能相同。"
+
+SNELL_PORT=${SBP_SNELL_PORT:-34448}
+valid_port "${SNELL_PORT}" || die "SBP_SNELL_PORT 无效。"
+while port_in_use "${SNELL_PORT}" || [[ ${SNELL_PORT} == "${PANEL_PORT}" || ${SNELL_PORT} == "${VLESS_PORT}" ]]; do
+  warn "Snell 默认端口 ${SNELL_PORT} 已占用，自动尝试下一个端口。"
+  SNELL_PORT=$((SNELL_PORT + 1))
+  valid_port "${SNELL_PORT}" || die "没有找到可用的 Snell 端口。"
+done
+
+choose_loopback_port() {
+  local preferred=$1 candidate
+  if ! port_in_use "${preferred}"; then
+    printf '%s\n' "${preferred}"
+    return
+  fi
+  for candidate in $(seq 10087 10120); do
+    if ! port_in_use "${candidate}"; then
+      warn "内部统计端口 ${preferred} 已占用，自动改用 ${candidate}。"
+      printf '%s\n' "${candidate}"
+      return
+    fi
+  done
+  die "没有找到可用的内部统计端口。"
+}
+
+V2RAY_API_PORT=$(choose_loopback_port "${SBP_V2RAY_API_PORT:-10085}")
+CLASH_API_PORT=$(choose_loopback_port "${SBP_CLASH_API_PORT:-10086}")
+if [[ ${CLASH_API_PORT} == "${V2RAY_API_PORT}" ]]; then
+  CLASH_API_PORT=$(choose_loopback_port "$((CLASH_API_PORT + 1))")
+fi
+
+SNELL_PSK=${SBP_SNELL_PSK:-$(openssl rand -hex 16)}
+PANEL_AGENT_TOKEN=${SBP_AGENT_TOKEN:-$(openssl rand -hex 32)}
+PANEL_UPGRADE_TOKEN=${SBP_UPGRADE_TOKEN:-$(openssl rand -hex 32)}
+[[ ${PANEL_UPGRADE_TOKEN} != "${PANEL_AGENT_TOKEN}" ]] || PANEL_UPGRADE_TOKEN=$(openssl rand -hex 32)
+PANEL_UPGRADE_PUBLIC_KEY=${SBP_UPGRADE_PUBLIC_KEY:-$(tr -d '\r\n' <"${TMP_DIR}/${UPGRADE_PUBLIC_KEY_ASSET}" 2>/dev/null || true)}
+[[ -z ${PANEL_UPGRADE_PUBLIC_KEY} || ${PANEL_UPGRADE_PUBLIC_KEY} =~ ^[A-Za-z0-9_-]{43}$ ]] || die "Ed25519 升级公钥格式无效。"
+PANEL_CENTRAL_ENABLED=true
+
+REALITY_SERVER=${SBP_REALITY_SERVER:-www.apple.com}
+REALITY_SERVER=$(prompt "Reality 伪装/握手域名" "${REALITY_SERVER}")
+[[ ${REALITY_SERVER} =~ ^[A-Za-z0-9.-]+$ ]] || die "SBP_REALITY_SERVER 无效。"
+ADMIN_USER=${SBP_ADMIN_USER:-admin}
+ADMIN_USER=$(prompt "管理员用户名" "${ADMIN_USER}")
+[[ ${ADMIN_USER} =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die "SBP_ADMIN_USER 无效。"
+ADMIN_PASSWORD=${SBP_ADMIN_PASSWORD:-}
+if [[ -z ${ADMIN_PASSWORD} ]]; then ADMIN_PASSWORD=$(prompt_secret "管理员密码"); fi
+ADMIN_PASSWORD=${ADMIN_PASSWORD:-$(openssl rand -hex 16)}
+(( ${#ADMIN_PASSWORD} >= 12 )) || die "SBP_ADMIN_PASSWORD 至少需要 12 个字符。"
+[[ ${ADMIN_PASSWORD} =~ ^[A-Za-z0-9._~!@%^+=:-]+$ ]] || die "SBP_ADMIN_PASSWORD 含有不支持的字符。"
+TLS_EMAIL=${SBP_TLS_EMAIL:-}
+if [[ ${TLS_ENABLED} == 1 ]]; then TLS_EMAIL=$(prompt "Let's Encrypt 联系邮箱（可留空）" "${TLS_EMAIL}"); fi
+[[ -z ${TLS_EMAIL} || ${TLS_EMAIL} =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die "邮箱格式无效。"
+
+if [[ ${TLS_ENABLED} == 1 ]]; then
+  if [[ ${PANEL_PUBLIC_PORT} == 443 ]]; then EXPECTED_PUBLIC_URL="https://${PUBLIC_HOST}"; else EXPECTED_PUBLIC_URL="https://${PUBLIC_HOST}:${PANEL_PUBLIC_PORT}"; fi
+else
+  if [[ ${PANEL_PUBLIC_PORT} == 80 ]]; then EXPECTED_PUBLIC_URL="http://${PUBLIC_HOST}"; else EXPECTED_PUBLIC_URL="http://${PUBLIC_HOST}:${PANEL_PUBLIC_PORT}"; fi
+fi
+if [[ -n ${SBP_PUBLIC_BASE_URL:-} ]]; then
+  PUBLIC_BASE_URL=${SBP_PUBLIC_BASE_URL}
+else
+  PUBLIC_BASE_URL=${EXPECTED_PUBLIC_URL}
+fi
+[[ ${PUBLIC_BASE_URL} =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || die "SBP_PUBLIC_BASE_URL 仅支持 http(s)://主机:端口。"
+if [[ ${TLS_ENABLED} == 1 && ${PUBLIC_BASE_URL} != "${EXPECTED_PUBLIC_URL}" ]]; then
+  die "启用自动 HTTPS 时，SBP_PUBLIC_BASE_URL 必须为 ${EXPECTED_PUBLIC_URL}。"
+fi
+
+install_native_nginx() {
+  port_in_use 80 && die "公网 80 已被未知服务占用，无法自动安装用于 HTTPS 的 Nginx。"
+  log "未发现 OpenResty/Nginx，安装原生 Nginx"
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -y
+    DEBIAN_FRONTEND=noninteractive apt-get install -y nginx
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y nginx
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y nginx
+  else
+    die "无法自动安装 Nginx，请先安装 OpenResty 或 Nginx 后重试。"
+  fi
+  systemctl enable --now nginx >/dev/null
+}
+
+container_has_public_http() {
+  local container=$1
+  docker inspect "${container}" | jq -e '
+    .[0] as $c |
+    ($c.HostConfig.NetworkMode == "host") or
+    any($c.NetworkSettings.Ports["80/tcp"][]?; .HostPort == "80")
+  ' >/dev/null 2>&1
+}
+
+detect_container_web() {
+  command -v docker >/dev/null 2>&1 || return 1
+  local container network mount source destination gateway expanded base_source base_destination
+  while IFS=$'\t' read -r container _; do
+    [[ -n ${container} ]] || continue
+    container_has_public_http "${container}" || continue
+    if docker exec "${container}" openresty -t >/dev/null 2>&1; then
+      WEB_BINARY=openresty
+    elif docker exec "${container}" nginx -t >/dev/null 2>&1; then
+      WEB_BINARY=nginx
+    else
+      continue
+    fi
+    mount=$(docker inspect "${container}" | jq -r '
+      first(.[0].Mounts[] |
+        select(.RW == true and (.Destination | endswith("/conf.d"))) |
+        [.Source, .Destination] | @tsv) // empty
+    ')
+    if [[ -z ${mount} ]]; then
+      expanded=$(docker exec "${container}" "${WEB_BINARY}" -T 2>&1)
+      while IFS=$'\t' read -r base_source base_destination; do
+        [[ -d ${base_source}/conf.d ]] || continue
+        if grep -F "${base_destination}/conf.d/*.conf" <<<"${expanded}" >/dev/null; then
+          mount=${base_source}/conf.d$'\t'${base_destination}/conf.d
+          break
+        fi
+      done < <(docker inspect "${container}" | jq -r '.[0].Mounts[] | select(.RW == true) | [.Source, .Destination] | @tsv')
+    fi
+    [[ -n ${mount} ]] || continue
+    IFS=$'\t' read -r source destination <<<"${mount}"
+    [[ -d ${source} ]] || continue
+    network=$(docker inspect "${container}" --format '{{.HostConfig.NetworkMode}}')
+    if [[ ${network} == host ]]; then
+      gateway=127.0.0.1
+    else
+      gateway=$(docker inspect "${container}" | jq -r '.[0].NetworkSettings.Networks | to_entries[0].value.Gateway // empty')
+      [[ -n ${gateway} ]] || continue
+    fi
+    WEB_MODE=container
+    WEB_CONTAINER=${container}
+    WEB_CONF_HOST=${source}
+    WEB_CONF_RUNTIME=${destination}
+    WEB_PROXY_HOST=${gateway}
+    return 0
+  done < <(
+    docker ps --format '{{.Names}}\t{{.Image}}' |
+      awk '{line=tolower($0); if (line ~ /openresty|nginx/) {priority=(line ~ /1panel.*openresty/ ? 0 : 1); print priority "\t" $0}}' |
+      sort -n | cut -f2-
+  )
+  return 1
+}
+
+detect_host_web() {
+  local dump candidate binary service
+  if command -v openresty >/dev/null 2>&1; then
+    binary=$(command -v openresty)
+    service=openresty
+  elif [[ -x /usr/local/openresty/bin/openresty ]]; then
+    binary=/usr/local/openresty/bin/openresty
+    service=openresty
+  elif command -v nginx >/dev/null 2>&1; then
+    binary=$(command -v nginx)
+    service=nginx
+  else
+    return 1
+  fi
+  dump=$(${binary} -T 2>&1) || return 1
+  for candidate in /etc/nginx/conf.d /etc/openresty/conf.d /usr/local/openresty/nginx/conf/conf.d; do
+    [[ -d ${candidate} ]] || continue
+    if grep -F "${candidate}/*.conf" <<<"${dump}" >/dev/null; then
+      WEB_MODE=host
+      WEB_BINARY=${binary}
+      WEB_SERVICE=${service}
+      WEB_CONF_HOST=${candidate}
+      WEB_CONF_RUNTIME=${candidate}
+      WEB_PROXY_HOST=127.0.0.1
+      if systemctl list-unit-files "${service}.service" --no-legend 2>/dev/null | grep -q .; then
+        if ! systemctl is-active --quiet "${service}"; then
+          port_in_use 80 && return 1
+          systemctl enable --now "${service}" >/dev/null
+        fi
+      elif ! port_in_use 80; then
+        "${binary}"
+      fi
+      return 0
+    fi
+  done
+  return 1
+}
+
+detect_web_server() {
+  if detect_container_web; then
+    log "检测到容器版 ${WEB_BINARY}：${WEB_CONTAINER}"
+    return
+  fi
+  if detect_host_web; then
+    log "检测到宿主机原生 ${WEB_BINARY}"
+    return
+  fi
+  if port_in_use 80; then
+    die "公网 80 已被无法识别的服务占用；安装器不会停止未知服务。请释放 80 或使用 SBP_TLS=0。"
+  fi
+  install_native_nginx
+  detect_host_web || die "Nginx 安装完成但无法找到可写且已 include 的 conf.d 目录。"
+}
+
+web_test() {
+  if [[ ${WEB_MODE} == container ]]; then
+    docker exec "${WEB_CONTAINER}" "${WEB_BINARY}" -t
+  else
+    "${WEB_BINARY}" -t
+  fi
+}
+
+web_reload() {
+  if [[ ${WEB_MODE} == container ]]; then
+    docker exec "${WEB_CONTAINER}" "${WEB_BINARY}" -s reload
+  elif systemctl list-unit-files "${WEB_SERVICE}.service" --no-legend 2>/dev/null | grep -q .; then
+    systemctl reload "${WEB_SERVICE}"
+  else
+    "${WEB_BINARY}" -s reload
+  fi
+}
+
+web_dump() {
+  if [[ ${WEB_MODE} == container ]]; then
+    docker exec "${WEB_CONTAINER}" "${WEB_BINARY}" -T 2>&1
+  else
+    "${WEB_BINARY}" -T 2>&1
+  fi
+}
+
+rollback_web_config() {
+  [[ -n ${WEB_CONFIG_FILE} ]] || return 0
+  warn "恢复安装前的 Web 配置"
+  if [[ -n ${WEB_CONFIG_BACKUP} && -f ${WEB_CONFIG_BACKUP} ]]; then
+    cp -a "${WEB_CONFIG_BACKUP}" "${WEB_CONFIG_FILE}"
+  else
+    rm -f "${WEB_CONFIG_FILE}"
+  fi
+  if web_test >/dev/null 2>&1; then web_reload >/dev/null 2>&1 || true; fi
+  TLS_ROLLBACK_PENDING=0
+}
+
+apply_web_config() {
+  local source=$1
+  install -o root -g root -m 0644 "${source}" "${WEB_CONFIG_FILE}"
+  web_test || die "新的 OpenResty/Nginx 配置校验失败，正在自动恢复。"
+  web_reload
+}
+
+write_reload_helper() {
+  if [[ ${WEB_MODE} == container ]]; then
+    cat >/usr/local/libexec/sb-panel-web-reload <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+# Nodrivo protocol certificate permissions
+chown root:sb-panel '${WEB_CERT_HOST}/privkey.pem'
+chmod 0640 '${WEB_CERT_HOST}/privkey.pem'
+chmod 0644 '${WEB_CERT_HOST}/fullchain.pem'
+docker exec '${WEB_CONTAINER}' '${WEB_BINARY}' -t
+docker exec '${WEB_CONTAINER}' '${WEB_BINARY}' -s reload
+EOF
+  else
+    cat >/usr/local/libexec/sb-panel-web-reload <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+# Nodrivo protocol certificate permissions
+chown root:sb-panel '${WEB_CERT_HOST}/privkey.pem'
+chmod 0640 '${WEB_CERT_HOST}/privkey.pem'
+chmod 0644 '${WEB_CERT_HOST}/fullchain.pem'
+'${WEB_BINARY}' -t
+if systemctl list-unit-files '${WEB_SERVICE}.service' --no-legend 2>/dev/null | grep -q .; then
+  systemctl reload '${WEB_SERVICE}'
+else
+  '${WEB_BINARY}' -s reload
+fi
+EOF
+  fi
+  chmod 0755 /usr/local/libexec/sb-panel-web-reload
+}
+
+prepare_tls() {
+  [[ ${TLS_ENABLED} == 1 ]] || return 0
+  [[ ${PANEL_PUBLIC_PORT} != "${VLESS_PORT}" ]] || die "面板 HTTPS 端口不能与 VLESS 端口相同。"
+  detect_web_server
+
+  local safe stamp resolved acme_source expanded
+  safe=${PUBLIC_HOST//[^A-Za-z0-9.-]/_}
+  WEB_CONFIG_FILE=${WEB_CONF_HOST}/zz-sb-panel-${safe}.conf
+  expanded=$(web_dump)
+  if grep -E "server_name[[:space:]]+([^;[:space:]]+[[:space:]]+)*${PUBLIC_HOST//./\\.}([[:space:];])" <<<"${expanded}" >/dev/null; then
+    if [[ ! -f ${WEB_CONFIG_FILE} ]] || ! grep -E "Managed by (Nodrivo|SailBox)" "${WEB_CONFIG_FILE}" >/dev/null; then
+      die "域名 ${PUBLIC_HOST} 已存在于当前 Web 配置中。为防止覆盖现有网站，请换一个面板子域名。"
+    fi
+  fi
+  if port_in_use "${PANEL_PUBLIC_PORT}" && [[ ${PANEL_PUBLIC_PORT} != 80 ]]; then
+    if grep -E "listen[[:space:]]+([^;[:space:]]+:)?${PANEL_PUBLIC_PORT}([[:space:];])" <<<"${expanded}" >/dev/null; then
+      log "面板公网端口 ${PANEL_PUBLIC_PORT} 已由现有 Web 服务监听，将复用该监听器。"
+    else
+      die "面板公网端口 ${PANEL_PUBLIC_PORT} 被其他服务占用，请选择空闲端口。"
+    fi
+  fi
+
+  stamp=$(date -u +%Y%m%d-%H%M%S)
+  WEB_ROOT_HOST=${WEB_CONF_HOST}/sb-panel-acme/${safe}
+  WEB_ROOT_RUNTIME=${WEB_CONF_RUNTIME}/sb-panel-acme/${safe}
+  WEB_CERT_HOST=${WEB_CONF_HOST}/sb-panel-certs/${safe}
+  WEB_CERT_RUNTIME=${WEB_CONF_RUNTIME}/sb-panel-certs/${safe}
+  install -d -m 0755 "${WEB_ROOT_HOST}/.well-known/acme-challenge" "${WEB_CERT_HOST}"
+  if [[ -f ${WEB_CONFIG_FILE} ]]; then
+    install -d -m 0700 "${BACKUP_ROOT}/${stamp}-tls-config"
+    WEB_CONFIG_BACKUP=${BACKUP_ROOT}/${stamp}-tls-config/$(basename "${WEB_CONFIG_FILE}")
+    cp -a "${WEB_CONFIG_FILE}" "${WEB_CONFIG_BACKUP}"
+  fi
+  TLS_ROLLBACK_PENDING=1
+
+  cat >"${TMP_DIR}/sb-panel-http.conf" <<EOF
+# Managed by Nodrivo. Manual changes may be replaced by the installer.
+server {
+    listen 80;
+    server_name ${PUBLIC_HOST};
+
+    location ^~ /.well-known/acme-challenge/ {
+        root ${WEB_ROOT_RUNTIME};
+        default_type text/plain;
+        try_files \$uri =404;
+    }
+
+    location / { return 404; }
+}
+EOF
+  apply_web_config "${TMP_DIR}/sb-panel-http.conf"
+
+  local preflight_body=
+  printf 'sb-panel-acme-ok\n' >"${WEB_ROOT_HOST}/.well-known/acme-challenge/preflight"
+  for _ in {1..20}; do
+    preflight_body=$(curl --noproxy '*' -fsS --max-time 3 --resolve "${PUBLIC_HOST}:80:127.0.0.1" "http://${PUBLIC_HOST}/.well-known/acme-challenge/preflight" 2>/dev/null || true)
+    [[ ${preflight_body} == sb-panel-acme-ok ]] && break
+    sleep 0.25
+  done
+  if [[ ${preflight_body} != sb-panel-acme-ok ]]; then
+    die "本机 HTTP-01 预检失败：OpenResty/Nginx 未正确提供 ACME 验证目录。"
+  fi
+  rm -f "${WEB_ROOT_HOST}/.well-known/acme-challenge/preflight"
+
+  if command -v getent >/dev/null 2>&1; then
+    resolved=$({ getent ahostsv4 "${PUBLIC_HOST}" || true; } | awk '{print $1}' | sort -u | paste -sd, -)
+    log "DNS 检查：${PUBLIC_HOST} -> ${resolved:-未解析}；本机公网 IP：${DETECTED_PUBLIC_IP:-未知}"
+    [[ -n ${resolved} ]] || die "域名尚未解析，无法申请证书。"
+    if [[ -n ${DETECTED_PUBLIC_IP} && ,${resolved}, != *",${DETECTED_PUBLIC_IP},"* ]]; then
+      warn "域名未直接解析到本机公网 IP；若使用 Cloudflare 代理，请确认其能访问本机 80 端口。"
+    fi
+  fi
+
+  if [[ -s ${WEB_CERT_HOST}/fullchain.pem && -s ${WEB_CERT_HOST}/privkey.pem ]] && openssl x509 -in "${WEB_CERT_HOST}/fullchain.pem" -noout -checkend 0 >/dev/null 2>&1; then
+    log "复用已签发的 Let's Encrypt 证书，不重复申请。"
+    write_reload_helper
+    return 0
+  fi
+
+  log "安装固定版本 acme.sh ${ACME_SH_VERSION}"
+  download "https://github.com/acmesh-official/acme.sh/archive/refs/tags/${ACME_SH_VERSION}.tar.gz" "${TMP_DIR}/acme.sh.tar.gz"
+  tar -xzf "${TMP_DIR}/acme.sh.tar.gz" -C "${TMP_DIR}"
+  acme_source=$(find "${TMP_DIR}" -maxdepth 2 -type f -path '*/acme.sh' -print -quit)
+  [[ -n ${acme_source} ]] || die "acme.sh 发布包内容无效。"
+  install -d -m 0700 "${APP_ROOT}/acme" "${CONFIG_DIR}/acme"
+  (
+    cd "$(dirname "${acme_source}")"
+    if [[ -n ${TLS_EMAIL} ]]; then
+      ./acme.sh --install --home "${APP_ROOT}/acme" --config-home "${CONFIG_DIR}/acme" --cert-home "${CONFIG_DIR}/acme/certs" --accountemail "${TLS_EMAIL}" --no-cron --no-profile
+    else
+      ./acme.sh --install --home "${APP_ROOT}/acme" --config-home "${CONFIG_DIR}/acme" --cert-home "${CONFIG_DIR}/acme/certs" --no-cron --no-profile
+    fi
+  )
+
+  log "通过 Let's Encrypt HTTP-01 申请证书"
+  "${APP_ROOT}/acme/acme.sh" --issue --server letsencrypt --home "${APP_ROOT}/acme" --config-home "${CONFIG_DIR}/acme" --cert-home "${CONFIG_DIR}/acme/certs" --keylength ec-256 -d "${PUBLIC_HOST}" -w "${WEB_ROOT_HOST}"
+  write_reload_helper
+  touch "${WEB_CERT_HOST}/privkey.pem" "${WEB_CERT_HOST}/fullchain.pem"
+  chmod 0600 "${WEB_CERT_HOST}/privkey.pem"
+  chmod 0644 "${WEB_CERT_HOST}/fullchain.pem"
+  "${APP_ROOT}/acme/acme.sh" --install-cert --server letsencrypt --home "${APP_ROOT}/acme" --config-home "${CONFIG_DIR}/acme" --cert-home "${CONFIG_DIR}/acme/certs" --ecc -d "${PUBLIC_HOST}" --key-file "${WEB_CERT_HOST}/privkey.pem" --fullchain-file "${WEB_CERT_HOST}/fullchain.pem" --reloadcmd /usr/local/libexec/sb-panel-web-reload
+}
+
+finalize_tls() {
+  [[ ${TLS_ENABLED} == 1 ]] || return 0
+  local redirect_port='' health_ready=0
+  [[ ${PANEL_PUBLIC_PORT} != 443 ]] && redirect_port=:${PANEL_PUBLIC_PORT}
+  cat >"${TMP_DIR}/sb-panel-https.conf" <<EOF
+# Managed by Nodrivo. Manual changes may be replaced by the installer.
+server {
+    listen 80;
+    server_name ${PUBLIC_HOST};
+
+    location ^~ /.well-known/acme-challenge/ {
+        root ${WEB_ROOT_RUNTIME};
+        default_type text/plain;
+        try_files \$uri =404;
+    }
+
+    location / { return 308 https://\$host${redirect_port}\$request_uri; }
+}
+
+server {
+    listen ${PANEL_PUBLIC_PORT} ssl;
+    server_name ${PUBLIC_HOST};
+
+    ssl_certificate ${WEB_CERT_RUNTIME}/fullchain.pem;
+    ssl_certificate_key ${WEB_CERT_RUNTIME}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:SBPanelTLS:10m;
+    ssl_session_timeout 1d;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    location / {
+        client_max_body_size 64m;
+        proxy_pass http://${WEB_PROXY_HOST}:${PANEL_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-Port ${PANEL_PUBLIC_PORT};
+    }
+}
+EOF
+  apply_web_config "${TMP_DIR}/sb-panel-https.conf"
+  for _ in {1..20}; do
+    if curl --noproxy '*' -fsS --max-time 3 --resolve "${PUBLIC_HOST}:${PANEL_PUBLIC_PORT}:127.0.0.1" "${PUBLIC_BASE_URL}/healthz" >/dev/null; then
+      health_ready=1
+      break
+    fi
+    sleep 0.25
+  done
+  if [[ ${health_ready} != 1 ]]; then
+    die "HTTPS 反向代理健康检查失败，正在自动恢复 Web 配置。"
+  fi
+
+  cat >/etc/systemd/system/sb-panel-cert-renew.service <<EOF
+[Unit]
+Description=Renew Nodrivo TLS certificate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${APP_ROOT}/acme/acme.sh --cron --home ${APP_ROOT}/acme --config-home ${CONFIG_DIR}/acme --cert-home ${CONFIG_DIR}/acme/certs
+PrivateTmp=true
+NoNewPrivileges=true
+EOF
+  cat >/etc/systemd/system/sb-panel-cert-renew.timer <<'EOF'
+[Unit]
+Description=Daily Nodrivo certificate renewal check
+
+[Timer]
+OnCalendar=*-*-* 03:17:00
+RandomizedDelaySec=45m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now sb-panel-cert-renew.timer >/dev/null
+  TLS_ROLLBACK_PENDING=0
+}
+
+log "安装 Nodrivo 兼容版 sing-box ${SING_BOX_VERSION}"
+SING_BOX_SOURCE=${TMP_DIR}/${SING_BOX_ASSET}
+[[ -x ${SING_BOX_SOURCE} ]] || die "sing-box 发布包内容无效。"
+"${SING_BOX_SOURCE}" version | grep -q 'with_v2ray_api' || die "下载的 sing-box 缺少流量统计支持，安装已停止。"
+
+if ! id sb-panel >/dev/null 2>&1; then
+  useradd --system --home-dir "${APP_ROOT}" --shell /usr/sbin/nologin sb-panel
+fi
+install -d -o sb-panel -g sb-panel -m 0750 "${APP_ROOT}" "${BIN_DIR}" "${DATA_DIR}"
+install -d -o root -g sb-panel -m 0750 "${CONFIG_DIR}"
+install -d -m 0700 "${BACKUP_ROOT}"
+install -d -m 0755 /usr/local/libexec
+install -o root -g root -m 0755 "${TMP_DIR}/${PANEL_ASSET}" "${PANEL_BIN}"
+install -o root -g root -m 0755 "${SING_BOX_SOURCE}" "${SING_BOX_BIN}"
+
+prepare_tls
+
+if [[ ${TLS_ENABLED} == 1 ]]; then
+  PANEL_BIND_HOST=${WEB_PROXY_HOST}
+  PANEL_COOKIE_SECURE=true
+  TLS_SERVER_NAME=${PUBLIC_HOST}
+  TLS_CERT_FILE=${WEB_CERT_HOST}/fullchain.pem
+  TLS_KEY_FILE=${WEB_CERT_HOST}/privkey.pem
+  chown root:sb-panel "${TLS_KEY_FILE}"
+  chmod 0640 "${TLS_KEY_FILE}"
+  chmod 0644 "${TLS_CERT_FILE}"
+else
+  PANEL_BIND_HOST=0.0.0.0
+  PANEL_COOKIE_SECURE=false
+  TLS_SERVER_NAME=
+  TLS_CERT_FILE=
+  TLS_KEY_FILE=
+fi
+
+umask 077
+cat >"${ENV_FILE}" <<EOF
+PANEL_DATA_DIR=${DATA_DIR}
+PANEL_DB=${DATA_DIR}/panel.db
+PANEL_LISTEN=${PANEL_BIND_HOST}:${PANEL_PORT}
+PANEL_ADMIN_USER=${ADMIN_USER}
+PANEL_ADMIN_PASSWORD=${ADMIN_PASSWORD}
+PANEL_COOKIE_SECURE=${PANEL_COOKIE_SECURE}
+PANEL_CENTRAL_ENABLED=${PANEL_CENTRAL_ENABLED}
+PANEL_AGENT_TOKEN=${PANEL_AGENT_TOKEN}
+PANEL_UPGRADE_TOKEN=${PANEL_UPGRADE_TOKEN}
+PANEL_UPGRADE_PUBLIC_KEY=${PANEL_UPGRADE_PUBLIC_KEY}
+NODRIVO_LICENSE_SERVER_URL=${NODRIVO_LICENSE_SERVER_URL:-${DEFAULT_LICENSE_SERVER_URL}}
+NODRIVO_LICENSE_PUBLIC_KEY=${NODRIVO_LICENSE_PUBLIC_KEY:-${DEFAULT_LICENSE_PUBLIC_KEY}}
+NODRIVO_LICENSE_FILE=${DATA_DIR}/license.json
+PANEL_CORE_MODE=systemd
+PANEL_MANAGE_CORE=false
+SINGBOX_BIN=${SING_BOX_BIN}
+SNELL_BIN=${SNELL_BIN}
+SINGBOX_CONFIG=${DATA_DIR}/sing-box.json
+SINGBOX_LOG=${DATA_DIR}/sing-box.log
+CORE_APPLY_REQUEST=${DATA_DIR}/core-apply.request
+CORE_APPLY_RESULT=${DATA_DIR}/core-apply.result
+SNELL_MANIFEST=${DATA_DIR}/snell-users.json
+SNELL_APPLY_REQUEST=${DATA_DIR}/snell-apply.request
+SNELL_APPLY_RESULT=${DATA_DIR}/snell-apply.result
+CORE_PID_FILE=/run/sb-panel-sing-box/main.pid
+CORE_APPLY_TIMEOUT=25s
+V2RAY_API_ADDR=127.0.0.1:${V2RAY_API_PORT}
+CLASH_API_ADDR=127.0.0.1:${CLASH_API_PORT}
+PANEL_UPGRADE_ARTIFACT=${DATA_DIR}/panel-upgrade.bin
+PANEL_UPGRADE_REQUEST=${DATA_DIR}/panel-upgrade.request
+PANEL_UPGRADE_RESULT=${DATA_DIR}/panel-upgrade.result
+PUBLIC_HOST=${PUBLIC_HOST}
+PUBLIC_BASE_URL=${PUBLIC_BASE_URL}
+VLESS_PUBLIC_HOST=${PUBLIC_HOST}
+VLESS_ENABLED=true
+VLESS_PORT=${VLESS_PORT}
+VLESS_LISTEN_HOST=0.0.0.0
+VLESS_LISTEN_PORT=${VLESS_PORT}
+REALITY_SERVER=${REALITY_SERVER}
+REALITY_HANDSHAKE_SERVER=${REALITY_SERVER}
+REALITY_PORT=443
+ANYTLS_SERVER_NAME=${TLS_SERVER_NAME}
+TLS_CERT_PATH=${TLS_CERT_FILE}
+TLS_KEY_PATH=${TLS_KEY_FILE}
+SNELL_ENABLED=false
+SNELL_PORT=${SNELL_PORT}
+SNELL_PSK=${SNELL_PSK}
+EOF
+chown root:sb-panel "${ENV_FILE}"
+chmod 0640 "${ENV_FILE}"
+
+install_snell_service
+install_panel_upgrade_service
+install_management_cli
+
+cat >/usr/local/libexec/sb-panel-sing-box-run <<'EOF'
+#!/bin/sh
+set -eu
+umask 027
+printf '%s\n' "$$" >/run/sb-panel-sing-box/main.pid
+exec /opt/sb-panel/bin/sing-box run -c /etc/sb-panel/sing-box.json
+EOF
+chmod 0755 /usr/local/libexec/sb-panel-sing-box-run
+
+cat >/usr/local/libexec/sb-panel-sing-box-apply <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+candidate=/opt/sb-panel/data/sing-box.json
+request=/opt/sb-panel/data/core-apply.request
+result=/opt/sb-panel/data/core-apply.result
+active=/etc/sb-panel/sing-box.json
+binary=/opt/sb-panel/bin/sing-box
+service=sing-box-sb-panel.service
+pid_file=/run/sb-panel-sing-box/main.pid
+backup_dir=/var/lib/sb-panel-core/backups
+lock_file=/run/lock/sb-panel-sing-box-apply.lock
+install -d -m 0700 "${backup_dir}"
+exec 9>"${lock_file}"
+flock -x 9
+request_id=
+request_hash=
+write_result() {
+  local ok=$1 error=$2 pid=${3:-0} temp=${result}.next
+  jq -n --arg id "${request_id}" --arg hash "${request_hash}" --argjson ok "${ok}" --arg error "${error}" --argjson pid "${pid}" --arg appliedAt "$(date -u +%FT%TZ)" '{id:$id,hash:$hash,ok:$ok,error:$error,pid:$pid,appliedAt:$appliedAt}' >"${temp}"
+  chown root:sb-panel "${temp}"; chmod 0640 "${temp}"; mv -f "${temp}" "${result}"
+}
+fail() { local message=$1; write_result false "${message}" 0; printf '%s\n' "${message}" >&2; exit 1; }
+[[ -s ${request} ]] || fail "apply request is missing"
+[[ -s ${candidate} ]] || fail "candidate sing-box configuration is missing"
+request_id=$(jq -er '.id | select(type == "string" and length > 0)' "${request}") || fail "invalid apply request id"
+request_hash=$(jq -er '.hash | select(type == "string" and length == 64)' "${request}") || fail "invalid apply request hash"
+check_output=
+if ! check_output=$("${binary}" check -c "${candidate}" 2>&1); then fail "sing-box check failed: ${check_output:0:1500}"; fi
+stamp=$(date -u +%Y%m%d-%H%M%S)
+rollback=${backup_dir}/${stamp}-${request_id}.json
+had_active=0
+if [[ -s ${active} ]]; then had_active=1; cp -a "${active}" "${rollback}"; chmod 0600 "${rollback}"; fi
+install -o root -g sb-panel -m 0640 "${candidate}" "${active}.next"
+mv -f "${active}.next" "${active}"
+start_error=
+if ! start_error=$(systemctl restart "${service}" 2>&1); then start_error="systemctl restart failed: ${start_error}"; fi
+healthy=0
+if [[ -z ${start_error} ]]; then
+  for _ in {1..30}; do
+    if systemctl is-active --quiet "${service}" && [[ -s ${pid_file} ]]; then
+      pid=$(tr -cd '0-9' <"${pid_file}")
+      if [[ -n ${pid} ]] && kill -0 "${pid}" 2>/dev/null; then healthy=1; break; fi
+    fi
+    sleep 0.2
+  done
+fi
+if [[ ${healthy} -ne 1 ]]; then
+  systemctl stop "${service}" >/dev/null 2>&1 || true
+  if [[ ${had_active} -eq 1 ]]; then install -o root -g sb-panel -m 0640 "${rollback}" "${active}"; systemctl restart "${service}" || true; fi
+  fail "new core failed its health check; ${start_error}"
+fi
+pid=$(tr -cd '0-9' <"${pid_file}")
+write_result true "" "${pid}"
+EOF
+chmod 0755 /usr/local/libexec/sb-panel-sing-box-apply
+
+cat >/etc/systemd/system/sb-panel.service <<'EOF'
+[Unit]
+Description=Nodrivo control plane
+After=network-online.target sing-box-sb-panel.service
+Wants=network-online.target sing-box-sb-panel.service
+
+[Service]
+Type=simple
+User=sb-panel
+Group=sb-panel
+WorkingDirectory=/opt/sb-panel
+EnvironmentFile=/etc/sb-panel/panel.env
+ExecStart=/opt/sb-panel/bin/sb-panel
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=12s
+KillMode=control-group
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=
+ReadWritePaths=/opt/sb-panel/data
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat >/etc/systemd/system/sing-box-sb-panel.service <<'EOF'
+[Unit]
+Description=sing-box data plane for Nodrivo
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=sb-panel
+Group=sb-panel
+WorkingDirectory=/opt/sb-panel
+RuntimeDirectory=sb-panel-sing-box
+RuntimeDirectoryMode=0750
+ExecStart=/usr/local/libexec/sb-panel-sing-box-run
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=12s
+KillMode=mixed
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ReadWritePaths=/opt/sb-panel/data
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat >/etc/systemd/system/sing-box-sb-panel-apply.service <<'EOF'
+[Unit]
+Description=Validate and atomically apply Nodrivo sing-box configuration
+After=sing-box-sb-panel.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/libexec/sb-panel-sing-box-apply
+TimeoutStartSec=45s
+StateDirectory=sb-panel-core
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+ReadWritePaths=/etc/sb-panel /opt/sb-panel/data /var/lib/sb-panel-core /run/lock
+EOF
+
+cat >/etc/systemd/system/sing-box-sb-panel-apply.path <<'EOF'
+[Unit]
+Description=Watch for Nodrivo sing-box apply requests
+
+[Path]
+PathChanged=/opt/sb-panel/data/core-apply.request
+Unit=sing-box-sb-panel-apply.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+log "初始化数据库和 sing-box 配置"
+set -a
+# shellcheck disable=SC1090
+. "${ENV_FILE}"
+set +a
+PANEL_CORE_MODE=config-only PANEL_MANAGE_CORE=false "${PANEL_BIN}" bootstrap
+"${SING_BOX_BIN}" check -c "${DATA_DIR}/sing-box.json"
+chown -R sb-panel:sb-panel "${DATA_DIR}"
+find "${DATA_DIR}" -type d -exec chmod 0750 {} +
+find "${DATA_DIR}" -type f -exec chmod 0640 {} +
+chmod 0600 "${DATA_DIR}/panel.db"
+install -o root -g sb-panel -m 0640 "${DATA_DIR}/sing-box.json" "${ACTIVE_CONFIG}"
+
+systemctl daemon-reload
+systemctl enable sing-box-sb-panel.service sing-box-sb-panel-apply.path snell-sb-panel-apply.path sb-panel-upgrade.path sb-panel.service >/dev/null
+systemctl start sing-box-sb-panel.service
+systemctl start sing-box-sb-panel-apply.path
+systemctl start sb-panel-upgrade.path
+systemctl start sb-panel.service
+if ! wait_for_health "${PANEL_PORT}" || ! systemctl is-active --quiet sing-box-sb-panel.service; then
+  systemctl status sb-panel.service sing-box-sb-panel.service --no-pager >&2 || true
+  journalctl -u sb-panel.service -u sing-box-sb-panel.service -n 60 --no-pager -o short-iso >&2 || true
+  die "服务健康检查失败；上方已打印真实错误日志。"
+fi
+
+finalize_tls
+
+cat >${BACKUP_ROOT}/credentials.txt <<EOF
+Nodrivo URL: ${PUBLIC_BASE_URL}
+Username: ${ADMIN_USER}
+Password: ${ADMIN_PASSWORD}
+VLESS port: ${VLESS_PORT}
+TLS enabled: ${TLS_ENABLED}
+Installed: $(date -u +%FT%TZ)
+EOF
+chmod 0600 ${BACKUP_ROOT}/credentials.txt
+
+if [[ ${LIGHTWEIGHT_REPLACED} == 1 ]]; then
+  LIGHTWEIGHT_ROLLBACK_PENDING=0
+  log "原轻量版备份：${LIGHTWEIGHT_BACKUP}"
+fi
+log "安装完成：$(${PANEL_BIN} version)"
+printf '\n访问地址：%s\n管理员：%s\n初始密码：%s\nVLESS 端口：%s\n\n' "${PUBLIC_BASE_URL}" "${ADMIN_USER}" "${ADMIN_PASSWORD}" "${VLESS_PORT}"
+if [[ ${TLS_ENABLED} == 1 ]]; then
+  log "Let's Encrypt 证书已启用自动续期。"
+else
+  warn "当前使用 HTTP。公开使用前请配置 HTTPS，并在面板中启用两步验证。"
+fi
+log "凭证已保存到 ${BACKUP_ROOT}/credentials.txt（权限 600）"
+log "管理命令：nodrivo（旧命令 sailbox 继续兼容）"
