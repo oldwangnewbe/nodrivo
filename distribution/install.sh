@@ -73,6 +73,47 @@ prompt_secret() {
   printf '%s\n' "${answer}"
 }
 
+admin_password_issue() {
+  local password=$1
+  if (( ${#password} < 12 )); then
+    printf '%s\n' "管理员密码至少需要 12 个字符。"
+    return 0
+  fi
+  if [[ ! ${password} =~ ^[A-Za-z0-9._~!@%^+=:-]+$ ]]; then
+    printf '%s\n' "管理员密码含有不支持的字符。"
+    return 0
+  fi
+  return 1
+}
+
+resolve_admin_password() {
+  local password=${SBP_ADMIN_PASSWORD:-} issue
+  if [[ -n ${password} ]]; then
+    if issue=$(admin_password_issue "${password}"); then
+      die "SBP_ADMIN_PASSWORD 无效：${issue}"
+    fi
+    printf '%s\n' "${password}"
+    return
+  fi
+  if ! has_tty; then
+    openssl rand -hex 16
+    return
+  fi
+  while true; do
+    password=$(prompt_secret "管理员密码")
+    if [[ -z ${password} ]]; then
+      openssl rand -hex 16
+      return
+    fi
+    if issue=$(admin_password_issue "${password}"); then
+      warn "${issue}请重新输入，或留空自动生成。"
+      continue
+    fi
+    printf '%s\n' "${password}"
+    return
+  done
+}
+
 confirm() {
   local label=$1 default=${2:-yes} suffix answer
   if ! has_tty; then
@@ -648,11 +689,7 @@ REALITY_SERVER=$(prompt "Reality 伪装/握手域名" "${REALITY_SERVER}")
 ADMIN_USER=${SBP_ADMIN_USER:-admin}
 ADMIN_USER=$(prompt "管理员用户名" "${ADMIN_USER}")
 [[ ${ADMIN_USER} =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die "SBP_ADMIN_USER 无效。"
-ADMIN_PASSWORD=${SBP_ADMIN_PASSWORD:-}
-if [[ -z ${ADMIN_PASSWORD} ]]; then ADMIN_PASSWORD=$(prompt_secret "管理员密码"); fi
-ADMIN_PASSWORD=${ADMIN_PASSWORD:-$(openssl rand -hex 16)}
-(( ${#ADMIN_PASSWORD} >= 12 )) || die "SBP_ADMIN_PASSWORD 至少需要 12 个字符。"
-[[ ${ADMIN_PASSWORD} =~ ^[A-Za-z0-9._~!@%^+=:-]+$ ]] || die "SBP_ADMIN_PASSWORD 含有不支持的字符。"
+ADMIN_PASSWORD=$(resolve_admin_password)
 TLS_EMAIL=${SBP_TLS_EMAIL:-}
 if [[ ${TLS_ENABLED} == 1 ]]; then TLS_EMAIL=$(prompt "Let's Encrypt 联系邮箱（可留空）" "${TLS_EMAIL}"); fi
 [[ -z ${TLS_EMAIL} || ${TLS_EMAIL} =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die "邮箱格式无效。"
