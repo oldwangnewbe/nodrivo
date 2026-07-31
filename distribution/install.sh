@@ -210,7 +210,7 @@ SING_BOX_ASSET=sing-box-sb-panel-${SING_BOX_VERSION}-linux-${ARCH}
 SNELL_ASSET=snell-server-v${SNELL_VERSION}-linux-$([[ ${ARCH} == arm64 ]] && echo aarch64 || echo amd64).zip
 RUNTIME_ASSET=sb-panel-runtime.tar.gz
 UPGRADE_PUBLIC_KEY_ASSET=upgrade-public-key.txt
-DEFAULT_LICENSE_SERVER_URL=https://nodrivo.malariafly.com
+DEFAULT_LICENSE_SERVER_URL=https://lisence.nodrivo.com
 DEFAULT_LICENSE_PUBLIC_KEY=KWktJUBOxFBgjNhftsXKcvPn/go7nn5N2EZtfbTMy/E
 
 download() {

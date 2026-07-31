@@ -13,6 +13,7 @@ curl -fsSL https://raw.githubusercontent.com/oldwangnewbe/nodrivo/main/distribut
 ```
 
 安装器会从本仓库下载最新授权版，校验 SHA-256 后完成安装。首次安装会进入交互式配置；未激活时为 5 用户基础版，之后可在面板的“版本与授权”页面激活许可证。
+新安装默认连接 `https://lisence.nodrivo.com` 授权中心；旧授权域名暂时保留给已安装版本兼容使用。
 
 ## 安装指定版本
 
