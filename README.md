@@ -17,10 +17,10 @@ curl -fsSL https://raw.githubusercontent.com/oldwangnewbe/nodrivo/main/distribut
 
 ## 安装指定版本
 
-例如安装授权版 v1.1.5：
+例如安装授权版 v1.1.7：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/oldwangnewbe/nodrivo/main/distribution/install.sh | sudo env SBP_VERSION=v1.1.5 bash
+curl -fsSL https://raw.githubusercontent.com/oldwangnewbe/nodrivo/main/distribution/install.sh | sudo env SBP_VERSION=v1.1.7 bash
 ```
 
 ## 许可
