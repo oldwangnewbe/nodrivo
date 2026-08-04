@@ -17,11 +17,13 @@ curl -fsSL https://raw.githubusercontent.com/oldwangnewbe/nodrivo/main/distribut
 
 ## 安装指定版本
 
-例如安装授权版 v1.2.1：
+例如安装授权版 v1.2.2：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/oldwangnewbe/nodrivo/main/distribution/install.sh | sudo env SBP_VERSION=v1.2.1 bash
+curl -fsSL https://raw.githubusercontent.com/oldwangnewbe/nodrivo/main/distribution/install.sh | sudo env SBP_VERSION=v1.2.2 bash
 ```
+
+v1.2.2 起，通过中心面板“添加服务器”生成的命令会为新服务器安装同版本轻量 Node。Node 不需要单独授权码，并会向已注册中心提供仅 Agent Token 可读取的内部用户日志；是否展示仍由中心的 Internal/Owner 授权控制。
 
 ## 许可
 
