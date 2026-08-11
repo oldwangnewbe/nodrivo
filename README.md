@@ -17,13 +17,13 @@ curl -fsSL https://raw.githubusercontent.com/oldwangnewbe/nodrivo/main/distribut
 
 ## 安装指定版本
 
-例如安装授权版 v1.2.2：
+例如安装授权版 v1.3.0：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/oldwangnewbe/nodrivo/main/distribution/install.sh | sudo env SBP_VERSION=v1.2.2 bash
+curl -fsSL https://raw.githubusercontent.com/oldwangnewbe/nodrivo/main/distribution/install.sh | sudo env SBP_VERSION=v1.3.0 bash
 ```
 
-v1.2.2 起，通过中心面板“添加服务器”生成的命令会为新服务器安装同版本轻量 Node。Node 不需要单独授权码，并会向已注册中心提供仅 Agent Token 可读取的内部用户日志；是否展示仍由中心的 Internal/Owner 授权控制。
+v1.3.0 Release 同时包含完整面板和轻量 Node 的签名制品。通过中心面板“添加服务器”生成的命令会为新服务器安装同版本轻量 Node；Node 不需要单独授权码，也不提供管理网页。完整版面板新增本机 ZIP 完整迁移与 WebDAV 加密灾备/增量恢复，WebDAV 凭据不会写入迁移包。
 
 ## 许可
 
