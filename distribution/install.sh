@@ -342,13 +342,32 @@ ensure_cert_reload_permissions() {
   install -o root -g root -m 0755 "${next}" "${helper}"
 }
 
+render_systemd_data_dir() {
+  local source=$1 target=$2 data_dir=$3 temporary line prefix suffix
+  [[ ${data_dir} == /* && ${data_dir} != / ]] || die "systemd 数据目录必须是非根绝对路径。"
+  temporary=${TMP_DIR}/$(basename "${target}").next
+  while IFS= read -r line || [[ -n ${line} ]]; do
+    while [[ ${line} == *'${data_dir}'* ]]; do
+      prefix=${line%%'${data_dir}'*}
+      suffix=${line#*'${data_dir}'}
+      line=${prefix}${data_dir}${suffix}
+    done
+    printf '%s\n' "${line}"
+  done <"${source}" >"${temporary}"
+  grep -Fq '${data_dir}' "${temporary}" && die "systemd 数据目录模板渲染失败。"
+  install -o root -g root -m 0644 "${temporary}" "${target}"
+}
+
 install_snell_service() {
+  local data_dir
+  data_dir=$(env_value PANEL_DATA_DIR)
+  data_dir=${data_dir:-${DATA_DIR}}
   install -o root -g root -m 0755 "${TMP_DIR}/snell-server" "${SNELL_BIN}"
   install -o root -g root -m 0755 "${TMP_DIR}/runtime/sb-panel-snell-apply.sh" /usr/local/libexec/sb-panel-snell-apply
   install -o root -g root -m 0755 "${TMP_DIR}/runtime/sb-panel-snell-run.sh" /usr/local/libexec/sb-panel-snell-run
   install -o root -g root -m 0644 "${TMP_DIR}/runtime/snell-sb-panel@.service" /etc/systemd/system/snell-sb-panel@.service
   install -o root -g root -m 0644 "${TMP_DIR}/runtime/snell-sb-panel-apply.service" /etc/systemd/system/snell-sb-panel-apply.service
-  install -o root -g root -m 0644 "${TMP_DIR}/runtime/snell-sb-panel-apply.path" /etc/systemd/system/snell-sb-panel-apply.path
+  render_systemd_data_dir "${TMP_DIR}/runtime/snell-sb-panel-apply.path" /etc/systemd/system/snell-sb-panel-apply.path "${data_dir}"
   install -d -o root -g sb-panel -m 0750 /etc/sb-panel/snell-users
   systemctl daemon-reload
   systemctl enable --now snell-sb-panel-apply.path >/dev/null
@@ -371,6 +390,10 @@ install_management_cli() {
   install -o root -g root -m 0755 "${TMP_DIR}/runtime/sailbox-certificate.sh" /usr/local/libexec/sailbox-certificate
   ln -sfn /usr/local/bin/nodrivo /root/nodrivo
   ln -sfn /usr/local/bin/nodrivo /root/sailbox
+  if [[ -f ${TMP_DIR}/runtime/install-panel-certificate-services.sh ]]; then
+    install -o root -g root -m 0755 "${TMP_DIR}/runtime/install-panel-certificate-services.sh" /usr/local/libexec/nodrivo-certificate-services
+    /usr/local/libexec/nodrivo-certificate-services "${PANEL_BIN}" "${ENV_FILE}" "${DATA_DIR}" sb-panel sb-panel
+  fi
 }
 
 lightweight_paths() {

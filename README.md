@@ -17,13 +17,13 @@ curl -fsSL https://raw.githubusercontent.com/oldwangnewbe/nodrivo/main/distribut
 
 ## 安装指定版本
 
-例如安装授权版 v1.3.1：
+例如安装授权版 v1.3.9：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/oldwangnewbe/nodrivo/main/distribution/install.sh | sudo env SBP_VERSION=v1.3.1 bash
+curl -fsSL https://raw.githubusercontent.com/oldwangnewbe/nodrivo/main/distribution/install.sh | sudo env SBP_VERSION=v1.3.9 bash
 ```
 
-v1.3.1 Release 同时包含完整面板和轻量 Node 的签名制品。通过中心面板“添加服务器”生成的命令会为新服务器安装同版本轻量 Node；Node 不需要单独授权码，也不提供管理网页。本版本将代理协议监听升级为 IPv4/IPv6 双栈，同时保留用户已经使用的 IPv4 订阅地址，不会自动改写现有链接。
+v1.3.9 Release 同时包含完整面板和轻量 Node 的签名制品。通过中心面板“添加服务器”生成的命令会为新服务器安装同版本轻量 Node；Node 不需要单独授权码，也不提供管理网页。完整面板可管理自己的域名证书及 HTTPS 登录入口。无域名的轻量 Node 可以直接使用 IP 安装，由中心验证节点的固定证书。
 
 ## 许可
 
